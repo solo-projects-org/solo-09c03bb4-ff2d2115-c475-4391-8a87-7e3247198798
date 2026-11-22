@@ -148,3 +148,127 @@ class BatchPiecesOut(BaseModel):
     relation_versions: dict[str, int] = Field(description="本次查询所用的两仓底表版本(同一快照)")
     total_pieces: str = Field(description="已换算行合计(精确值)")
     lines: list[LinePiecesOut]
+
+
+# ---------------------------------------------------------------- 签收对账
+
+MAX_RECEIPT_LINES = 12
+
+
+class ReceiptLineIn(BaseModel):
+    """一条签收行:件数 + 允许归属的候选出库行号。"""
+
+    line_no: int = Field(gt=0, examples=[1], description="签收行号,对账单内唯一")
+    pieces: Decimal = Field(gt=0, le=MAX_QUANTITY, examples=["300"], description="签收件数(正数,精确分数核算)")
+    candidates: list[int] = Field(
+        min_length=1,
+        max_length=10000,
+        examples=[[1, 2]],
+        description="候选出库行号(必须是本批次中该商品的行),可任意拆分归属",
+    )
+
+
+class ReconciliationOpenRequest(BaseModel):
+    """开对账单:冻结该商品各出库行的折件数与两仓底表版号。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "product": "P001",
+                    "receipt_lines": [
+                        {"line_no": 1, "pieces": 360, "candidates": [1]},
+                        {"line_no": 2, "pieces": 18, "candidates": [2]},
+                        {"line_no": 3, "pieces": 10, "candidates": [5]},
+                        {"line_no": 4, "pieces": 5, "candidates": [1]},
+                    ],
+                }
+            ]
+        }
+    )
+
+    product: str = Field(min_length=1, max_length=64, examples=["P001"], description="商品编码")
+    receipt_lines: list[ReceiptLineIn] = Field(
+        min_length=1, max_length=MAX_RECEIPT_LINES, description="签收行,最多 12 条"
+    )
+
+    @model_validator(mode="after")
+    def _unique_line_no(self) -> "ReconciliationOpenRequest":
+        line_nos = [line.line_no for line in self.receipt_lines]
+        if len(line_nos) != len(set(line_nos)):
+            raise ValueError("同一对账单内签收行 line_no 不能重复")
+        return self
+
+
+class FrozenOutboundLineOut(BaseModel):
+    line_no: int
+    pieces: str = Field(description="开单时冻结的折件数(精确值)")
+
+
+class ReceiptLineOut(BaseModel):
+    line_no: int
+    pieces: str = Field(description="开单时冻结的签收件数(精确值)")
+    candidates: list[int]
+    verified: bool = Field(description="是否已核实;已核实行必须保留,不得暂缓")
+    verified_at: str | None = None
+
+
+class AllocationOut(BaseModel):
+    receipt_line_no: int
+    outbound_line_no: int
+    pieces: str = Field(description="该签收行归属到该出库行的件数(精确值)")
+
+
+class OutboundUsedOut(BaseModel):
+    line_no: int
+    pieces: str = Field(description="该出库行被归属的合计件数(不超过冻结件数)")
+
+
+class SuggestionOut(BaseModel):
+    deferred_line_nos: list[int] = Field(description="最少要暂缓入账的签收行号")
+    deferred_pieces: str = Field(description="暂缓行的件数合计(精确值)")
+    kept_line_nos: list[int] = Field(description="其余保留行的行号")
+    allocations: list[AllocationOut] = Field(description="保留行的完整归属(可拆分)")
+    outbound_used: list[OutboundUsedOut] = Field(description="各出库行实际占用的件数")
+
+
+class ReconciliationOut(BaseModel):
+    batch_no: str
+    product: str
+    created_at: str
+    revision: int = Field(description="核实变更次数;每次实际新增核实 +1")
+    relation_versions: dict[str, int] = Field(description="开单时冻结的两仓底表版号,之后不再变化")
+    outbound_lines: list[FrozenOutboundLineOut] = Field(description="开单时冻结的该商品出库行折件数")
+    receipt_lines: list[ReceiptLineOut]
+    suggestion: SuggestionOut
+
+
+class VerifyRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"examples": [{"line_nos": [1, 2]}]}
+    )
+
+    line_nos: list[int] = Field(
+        min_length=1, max_length=MAX_RECEIPT_LINES, description="本次要核实的签收行号(重复核实只记一次)"
+    )
+
+
+class VerifyOut(BaseModel):
+    newly_verified: list[int] = Field(description="本次新标记为已核实的行号")
+    already_verified: list[int] = Field(description="提交时原本就已核实的行号(被忽略,不重复记账)")
+    reconciliation: ReconciliationOut
+
+
+class VerificationConflictBody(BaseModel):
+    error: str
+    message: str
+    reconciliation: ReconciliationOut = Field(description="按原状态(本次核实未生效)给出的对账结果")
+
+
+class ReconciliationSummaryOut(BaseModel):
+    product: str
+    created_at: str
+    revision: int
+    deferred_line_nos: list[int]
+    verified_line_nos: list[int]
+

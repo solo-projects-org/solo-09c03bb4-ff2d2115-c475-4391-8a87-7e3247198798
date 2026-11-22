@@ -1,4 +1,4 @@
-"""SQLite 存储层:换算底表(按仓分版本)与出库批次。
+"""SQLite 存储层:换算底表(按仓分版本)、出库批次与签收对账单。
 
 事务语义(对应需求):
 - 换表走 :func:`write_tx`(BEGIN IMMEDIATE),整个"读另一仓现行关系 →
@@ -9,6 +9,8 @@
   内完成,保证"一次查询用同一份已提交的换算关系"。
 - 批次只存原始行(商品/数量/单位),折算在查询时按当前生效底表现算,
   因此换表成功后已入库批次自动按新关系出数。
+- 对账单开单时把所选商品出库行的折件数、两仓底表版号冻结进库;核实状态也在
+  写事务内更新,并发核实由写锁串行化。
 """
 from __future__ import annotations
 
@@ -49,6 +51,37 @@ CREATE TABLE IF NOT EXISTS batch_lines (
     quantity TEXT NOT NULL,  -- 精确十进制字符串,折算时用 Fraction 解析
     unit TEXT NOT NULL,
     UNIQUE (batch_id, line_no)
+);
+-- 对账单:每批每种商品至多一张。开单时冻结出库行折件数与两仓底表版号。
+CREATE TABLE IF NOT EXISTS reconciliations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES batches (id),
+    product TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    relation_a_version INTEGER NOT NULL,
+    relation_b_version INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (batch_id, product)
+);
+CREATE TABLE IF NOT EXISTS reconciliation_outbound (
+    reconciliation_id INTEGER NOT NULL REFERENCES reconciliations (id),
+    line_no INTEGER NOT NULL,
+    pieces TEXT NOT NULL,  -- 冻结的折件数(精确十进制字符串)
+    PRIMARY KEY (reconciliation_id, line_no)
+);
+CREATE TABLE IF NOT EXISTS reconciliation_receipt_lines (
+    reconciliation_id INTEGER NOT NULL REFERENCES reconciliations (id),
+    line_no INTEGER NOT NULL,
+    pieces TEXT NOT NULL,  -- 冻结的签收件数(精确十进制字符串)
+    verified INTEGER NOT NULL DEFAULT 0 CHECK (verified IN (0, 1)),
+    verified_at TEXT,
+    PRIMARY KEY (reconciliation_id, line_no)
+);
+CREATE TABLE IF NOT EXISTS reconciliation_candidates (
+    reconciliation_id INTEGER NOT NULL REFERENCES reconciliations (id),
+    receipt_line_no INTEGER NOT NULL,
+    outbound_line_no INTEGER NOT NULL,
+    PRIMARY KEY (reconciliation_id, receipt_line_no, outbound_line_no)
 );
 """
 
@@ -226,3 +259,127 @@ def list_batches(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         "FROM batches b LEFT JOIN batch_lines l ON l.batch_id = b.id "
         "GROUP BY b.id ORDER BY b.id"
     ).fetchall()
+
+
+# ---------------------------------------------------------------- 对账单
+
+
+def get_reconciliation(conn: sqlite3.Connection, batch_id: int, product: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM reconciliations WHERE batch_id = ? AND product = ?",
+        (batch_id, product),
+    ).fetchone()
+
+
+def get_reconciliation_by_id(conn: sqlite3.Connection, reconciliation_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM reconciliations WHERE id = ?", (reconciliation_id,)
+    ).fetchone()
+
+
+def create_reconciliation(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    product: str,
+    versions: dict[str, int],
+    outbound: list[tuple[int, str]],
+    receipt_lines: list[tuple[int, str, bool, list[int]]],
+) -> int:
+    """开对账单。``receipt_lines`` 为 (line_no, pieces, verified, candidates)。"""
+    cur = conn.execute(
+        "INSERT INTO reconciliations "
+        "(batch_id, product, created_at, relation_a_version, relation_b_version) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (batch_id, product, _now(), versions.get("A", 0), versions.get("B", 0)),
+    )
+    reconciliation_id = cur.lastrowid
+    conn.executemany(
+        "INSERT INTO reconciliation_outbound (reconciliation_id, line_no, pieces) VALUES (?, ?, ?)",
+        [(reconciliation_id, line_no, pieces) for line_no, pieces in outbound],
+    )
+    for line_no, pieces, verified, candidates in receipt_lines:
+        conn.execute(
+            "INSERT INTO reconciliation_receipt_lines "
+            "(reconciliation_id, line_no, pieces, verified, verified_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (reconciliation_id, line_no, pieces, 1 if verified else 0, _now() if verified else None),
+        )
+        conn.executemany(
+            "INSERT INTO reconciliation_candidates "
+            "(reconciliation_id, receipt_line_no, outbound_line_no) VALUES (?, ?, ?)",
+            [(reconciliation_id, line_no, candidate) for candidate in candidates],
+        )
+    return reconciliation_id
+
+
+def get_reconciliation_outbound(
+    conn: sqlite3.Connection, reconciliation_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM reconciliation_outbound WHERE reconciliation_id = ? ORDER BY line_no",
+        (reconciliation_id,),
+    ).fetchall()
+
+
+def get_reconciliation_receipt_lines(
+    conn: sqlite3.Connection, reconciliation_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM reconciliation_receipt_lines WHERE reconciliation_id = ? ORDER BY line_no",
+        (reconciliation_id,),
+    ).fetchall()
+
+
+def get_reconciliation_candidates(
+    conn: sqlite3.Connection, reconciliation_id: int
+) -> dict[int, list[int]]:
+    rows = conn.execute(
+        "SELECT receipt_line_no, outbound_line_no FROM reconciliation_candidates "
+        "WHERE reconciliation_id = ? ORDER BY receipt_line_no, outbound_line_no",
+        (reconciliation_id,),
+    ).fetchall()
+    result: dict[int, list[int]] = {}
+    for row in rows:
+        result.setdefault(row["receipt_line_no"], []).append(row["outbound_line_no"])
+    return result
+
+
+def mark_verified(
+    conn: sqlite3.Connection, reconciliation_id: int, line_nos: list[int]
+) -> tuple[list[int], list[int]]:
+    """把签收行标为已核实。返回 (本次新标记的行号, 原本已核实的行号)。
+
+    幂等:同一行重复核实只记一次;已核实的行保留原 ``verified_at``。
+    """
+    already: list[int] = []
+    newly: list[int] = []
+    now = _now()
+    for line_no in line_nos:
+        row = conn.execute(
+            "SELECT verified FROM reconciliation_receipt_lines "
+            "WHERE reconciliation_id = ? AND line_no = ?",
+            (reconciliation_id, line_no),
+        ).fetchone()
+        if row is None:
+            raise KeyError(line_no)
+        if row["verified"]:
+            already.append(line_no)
+        else:
+            conn.execute(
+                "UPDATE reconciliation_receipt_lines SET verified = 1, verified_at = ? "
+                "WHERE reconciliation_id = ? AND line_no = ?",
+                (now, reconciliation_id, line_no),
+            )
+            newly.append(line_no)
+    return newly, already
+
+
+def bump_revision(conn: sqlite3.Connection, reconciliation_id: int) -> int:
+    conn.execute(
+        "UPDATE reconciliations SET revision = revision + 1 WHERE id = ?",
+        (reconciliation_id,),
+    )
+    row = conn.execute(
+        "SELECT revision FROM reconciliations WHERE id = ?", (reconciliation_id,)
+    ).fetchone()
+    return row["revision"]
