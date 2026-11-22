@@ -1,0 +1,14 @@
+services:
+  app:
+    build: .
+    image: recycle-conversion-api
+    ports:
+      - "8000:8000"
+    environment:
+      APP_DB_PATH: /data/app.db
+    volumes:
+      - app-data:/data
+    restart: unless-stopped
+
+volumes:
+  app-data:
